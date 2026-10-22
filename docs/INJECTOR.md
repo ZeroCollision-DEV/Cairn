@@ -65,40 +65,50 @@ closed*, or *cancelled*.
 
 ## Choosing the Minecraft instance
 
-The injector never picks a process silently when there is a choice.
+The injector never picks a process silently when there is a choice, and it never trusts a process name or a window title
+alone. The decision logic is `src/injector/TargetMatch.h`, which has no Windows dependency and is unit-tested.
 
-**Discovery.** It lists processes named `javaw.exe` (configurable under `[target]`) and looks at their visible top-level
-windows. Each process is classified from what can be observed:
+**Which processes are looked at.** `javaw.exe` and `java.exe` (plus `[target] process=` if you changed it). The official
+Minecraft Launcher and the Modrinth App are not Java processes and are never candidates; they only start the game. Which
+Java executable a launcher uses does not matter: official launcher, Modrinth App and other launchers all end up as a Java
+process running the game.
 
-| Shown as | Meaning |
+**What identifies the game.** For each Java process the injector collects:
+- its visible top-level windows with their window **class** (Minecraft 1.13+ creates its window through GLFW, class `GLFW30`) and title;
+- its command line, read with `NtQueryInformationProcess` (needs only the same access the injector already uses, no administrator rights).
+
+| Result | Condition |
 |---|---|
-| a selectable row | a window whose title contains "Minecraft" and not "launcher" - treated as a game |
-| a greyed row tagged *Launcher* | a window titled like a launcher; it cannot be selected |
-| not listed | a `javaw.exe` with no Minecraft window yet (still loading, a server, another Java program). It is only counted ("Minecraft is starting...") and named under *Details* |
+| **Game** (selectable) | a visible `GLFW30` window **and** either a Minecraft-style command line (`net.minecraft.client.main.Main`, Fabric/Quilt `KnotClient`, Forge/NeoForge client launch target, or `--assetIndex` with `--gameDir`) or a window title containing "Minecraft" |
+| **Starting** (greyed) | Minecraft-style command line, no game window yet |
+| **Launcher** (greyed) | launcher main class, or a "Launcher" titled non-game window |
+| not listed | any other Java process: IDEs, servers (a server GUI titled "Minecraft server" has no GLFW window), tools, a Java game that is not Minecraft |
 
-Each row shows the window title, process name, PID, and Cairn's own state in that process if it already published one
-(*running*, *starting*, *limited*, *failed*). A process that cannot be opened (different user or elevation) or is 32-bit is
-shown with the reason and cannot be selected.
+So a custom Modrinth window title ("My Pack | Survival") is fine as long as the command line identifies Minecraft; the title
+does not have to say "Minecraft". If the command line cannot be read and the title does not say Minecraft either, the window
+cannot be confirmed and is not offered. Details lists every skipped Java process and why. The command line contains the
+session token, so it is only reduced to facts (is it Minecraft, version, launcher brand) and is never stored, shown or logged.
 
 **Selection.**
 - One usable instance: it is selected automatically (the radio button shows it).
 - Several usable instances: nothing is selected until you click one; the button says *Multiple instances found. Select one.*
-- None: the button is disabled and the status line says why (no instance / only a launcher / still starting).
+- None: the button is disabled and the status line says why (nothing found / only a launcher / still starting).
 
-**Refresh and exits.** *Refresh* rescans immediately; the list also rescans every two seconds while idle (it is frozen while an
-operation runs). A selection is kept only if the same process is still there: identity is the PID **and** the process
-creation time, so a reused PID is not mistaken for the original. If the selected instance closes, the selection is cleared,
-a note says so, and the injector does **not** jump to another instance by itself.
+**Refresh, exits and stale selections.** *Refresh* rescans immediately; the list also rescans every two seconds while idle (it is
+frozen while an operation runs). A selection belongs to one exact process (PID **and** creation time, so a reused PID is never
+mistaken for the original) and is kept while that process exists, even if its window is briefly missing; the row then says why
+it is unavailable and the button is disabled. If the process is gone, the selection is cleared and a note
+("... has closed.") is shown for eight seconds, then disappears by itself. The injector does **not** jump to another instance
+during that time; once the note has expired the usual rule applies again (a single usable instance is pre-selected).
 
 **The selected process is the injected process.** The PID and creation time that were selected are passed unchanged to the
 worker and to the loader. They are re-validated at the click, again just before the remote thread is created, and the
 creation time is compared on the opened process handle. A mismatch aborts with "Not injected".
 
-**What the version tag means.** The tag on a row (e.g. `1.21.11`) is read from the window title only, such as
-`Minecraft* 1.21.11 - Singleplayer`. Titles can be changed by launchers and mods, and the injector does not read the game's
-memory or jars, so this is a hint, not verification. A tag other than 1.21.11 is shown in amber. When the title carries no
-version, none is shown. The injector cannot tell a vanilla client from a modded one, nor confirm Fabric Loader, before
-injection; the client reports its own result afterwards.
+**Version.** Shown when the command line states it (`--version fabric-loader-0.16.10-1.21.11` gives `1.21.11`), otherwise
+when the window title has it right after "Minecraft" (`Minecraft* 1.21.11 - Singleplayer`). Both are launcher-supplied text,
+not read from the game's files, so they are hints; Details says which source was used. A version other than 1.21.11 is shown in
+amber. The injector cannot confirm Fabric Loader or the installed mods before injection; the client reports its own result afterwards.
 
 ## How initialization is verified
 
@@ -149,7 +159,7 @@ needed for the download workflow; no live download has been made.
 ## Not verified
 
 None of this has been run against a real game yet. In particular untested: the TLS download against a real release,
-injection into a live game, process selection with two or more real Minecraft instances, how window titles look under
-different launchers, the status-block handshake, DWM shadow/rounded corners, DPI changes between monitors, window growth when
+injection into a live game, process selection with two or more real Minecraft instances, identification of games started by the
+official launcher and the Modrinth App (the matcher is unit-tested with sample command lines, not with live processes), the status-block handshake, DWM shadow/rounded corners, DPI changes between monitors, window growth when
 *Details* is opened, and cache cleanup against a game that holds the DLL. The injector layout has been reviewed in source
 only; it has not been viewed on screen.

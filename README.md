@@ -59,7 +59,7 @@ output folder; those old folders are left untouched and can be deleted by hand.
 3. Press **Download & Inject**. The injector re-checks the selected process, downloads the release DLL, verifies it,
    injects it into **that** process and then waits for the client to report that it actually started. Success is shown
    only after that report.
-4. In game press **Right Shift** for the menu.
+4. In game press **Right Shift** (the right-hand key only) to open or close the menu. It acts once per key press, only while the game window has focus, and not while you are typing in a menu text field.
 
 The release URL and SHA-256 are **not built in** and are still **unconfigured**: see [docs/INJECTOR.md](docs/INJECTOR.md).
 Until both are set in `config\injector.ini` the button stays disabled and says why. No repository, release or hash has

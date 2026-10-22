@@ -12,7 +12,9 @@
 #include <cwctype>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 
@@ -758,34 +760,93 @@ namespace inj
             return (static_cast<unsigned long long>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
         }
 
-        // "Minecraft* 1.21.11 - Singleplayer" -> "1.21.11". Only what the window title literally says;
-        // launchers and mods can change the title, so callers must not treat this as authoritative.
-        std::string versionFromTitle(const std::wstring& title)
+        // Reads the target's command line with NtQueryInformationProcess(ProcessCommandLineInformation), which
+        // needs only PROCESS_QUERY_LIMITED_INFORMATION (Windows 8.1+) and no administrator rights. The text is
+        // only parsed into facts by the caller and never stored or logged: it contains the session token.
+        std::string commandLineOf(HANDLE proc)
         {
-            const std::wstring low = lowerW(title);
-            size_t i = low.find(L"minecraft");
-            if (i == std::wstring::npos) return {};
-            i += 9;
-            while (i < title.size() && (title[i] == L'*' || title[i] == L' ')) i++;
-            size_t j = i;
-            bool dot = false;
-            while (j < title.size() && (iswdigit(title[j]) || title[j] == L'.'))
+            struct UStr { USHORT Length; USHORT MaximumLength; PWSTR Buffer; };
+            typedef LONG(NTAPI * NtQueryFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+            static const NtQueryFn query = reinterpret_cast<NtQueryFn>(
+                reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess")));
+            if (!query) return {};
+            const ULONG kProcessCommandLineInformation = 60;
+            ULONG need = 0;
+            query(proc, kProcessCommandLineInformation, nullptr, 0, &need);
+            if (need < sizeof(UStr) || need > (1u << 20)) return {};
+            std::vector<unsigned char> buf(static_cast<size_t>(need) + 16, 0);
+            ULONG got = 0;
+            if (query(proc, kProcessCommandLineInformation, buf.data(), need, &got) < 0) return {};
+            const UStr* us = reinterpret_cast<const UStr*>(buf.data());
+            const unsigned char* b = reinterpret_cast<const unsigned char*>(us->Buffer);
+            if (!us->Buffer || us->Length == 0) return {};
+            if (b < buf.data() || b + us->Length > buf.data() + buf.size()) return {};   // must point inside our buffer
+            return narrow(std::wstring(us->Buffer, us->Length / sizeof(wchar_t)));
+        }
+
+        // The command line of a running process does not change, so the parsed result is cached per
+        // (pid, creation time). Failures are not cached and are retried on the next scan.
+        struct CmdKey
+        {
+            unsigned long pid;
+            unsigned long long start;
+            bool operator<(const CmdKey& o) const { return pid != o.pid ? pid < o.pid : start < o.start; }
+        };
+        std::mutex g_cmdMutex;
+        std::map<CmdKey, CmdInfo> g_cmdCache;
+
+        CmdInfo cmdInfoFor(HANDLE proc, unsigned long pid, unsigned long long start)
+        {
+            if (start != 0)
             {
-                if (title[j] == L'.') dot = true;
-                j++;
+                std::lock_guard<std::mutex> g(g_cmdMutex);
+                auto it = g_cmdCache.find({ pid, start });
+                if (it != g_cmdCache.end()) return it->second;
             }
-            if (j == i || !dot || !iswdigit(title[i])) return {};
-            return narrow(title.substr(i, j - i));
+            const CmdInfo info = parseCommandLine(commandLineOf(proc));
+            if (info.known && start != 0)
+            {
+                std::lock_guard<std::mutex> g(g_cmdMutex);
+                g_cmdCache[{ pid, start }] = info;
+            }
+            return info;
+        }
+
+        void pruneCmdCache(const std::set<DWORD>& alive)
+        {
+            std::lock_guard<std::mutex> g(g_cmdMutex);
+            for (auto it = g_cmdCache.begin(); it != g_cmdCache.end();)
+                it = alive.count(static_cast<DWORD>(it->first.pid)) ? std::next(it) : g_cmdCache.erase(it);
+        }
+
+        int kindRank(TargetKind k)
+        {
+            switch (k)
+            {
+            case TargetKind::Game:     return 0;
+            case TargetKind::Starting: return 1;
+            case TargetKind::Launcher: return 2;
+            default:                   return 3;
+            }
         }
     }
 
     std::vector<Target> findTargets(const Config& cfg)
     {
         std::vector<Target> out;
-        const std::wstring procName = widen(cfg.processName);
-        if (procName.empty()) return out;
 
-        std::set<DWORD> pids;
+        // Java executables to consider: the configured one plus the two standard names. javaw.exe is what the
+        // official launcher runs; other launchers may start java.exe. Being a candidate proves nothing by itself.
+        std::vector<std::wstring> names;
+        for (const std::wstring& n : { widen(cfg.processName), std::wstring(L"javaw.exe"), std::wstring(L"java.exe") })
+        {
+            if (n.empty()) continue;
+            bool dup = false;
+            for (const auto& e : names) if (_wcsicmp(e.c_str(), n.c_str()) == 0) dup = true;
+            if (!dup) names.push_back(n);
+        }
+
+        std::map<DWORD, std::wstring> exeOf;
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap == INVALID_HANDLE_VALUE) return out;
         PROCESSENTRY32W pe = {};
@@ -793,17 +854,22 @@ namespace inj
         if (Process32FirstW(snap, &pe))
             do
             {
-                if (_wcsicmp(pe.szExeFile, procName.c_str()) == 0) pids.insert(pe.th32ProcessID);
+                for (const auto& n : names)
+                    if (_wcsicmp(pe.szExeFile, n.c_str()) == 0) { exeOf[pe.th32ProcessID] = pe.szExeFile; break; }
             } while (Process32NextW(snap, &pe));
         CloseHandle(snap);
+
+        std::set<DWORD> pids;
+        for (const auto& kv : exeOf) pids.insert(kv.first);
+        pruneCmdCache(pids);
         if (pids.empty()) return out;
 
+        // Visible top-level windows of those processes (title and window class).
         struct Ctx
         {
             const std::set<DWORD>* pids;
-            std::wstring needle;
-            std::map<DWORD, std::wstring> titles;
-        } ctx{ &pids, lowerW(widen(cfg.windowTitleContains)), {} };
+            std::map<DWORD, std::vector<WindowInfo>> windows;
+        } ctx{ &pids, {} };
 
         EnumWindows(+[](HWND hw, LPARAM lp) -> BOOL
         {
@@ -812,12 +878,16 @@ namespace inj
             DWORD pid = 0;
             GetWindowThreadProcessId(hw, &pid);
             if (!c->pids->count(pid)) return TRUE;
-            wchar_t t[512] = {};
-            const int n = GetWindowTextW(hw, t, 512);
-            if (n <= 0) return TRUE;
-            const std::wstring title(t, static_cast<size_t>(n));
-            if (c->needle.empty() || lowerW(title).find(c->needle) != std::wstring::npos)
-                if (!c->titles.count(pid)) c->titles[pid] = title;
+            auto& list = c->windows[pid];
+            if (list.size() >= 32) return TRUE;
+            wchar_t title[512] = {};
+            wchar_t cls[256] = {};
+            const int tn = GetWindowTextW(hw, title, 512);
+            const int cn = GetClassNameW(hw, cls, 256);
+            WindowInfo w;
+            w.title = narrow(std::wstring(title, tn > 0 ? static_cast<size_t>(tn) : 0));
+            w.className = narrow(std::wstring(cls, cn > 0 ? static_cast<size_t>(cn) : 0));
+            list.push_back(std::move(w));
             return TRUE;
         }, reinterpret_cast<LPARAM>(&ctx));
 
@@ -825,17 +895,12 @@ namespace inj
         {
             Target t;
             t.pid = pid;
-            t.exeName = cfg.processName;
-            auto it = ctx.titles.find(pid);
-            t.titleMatched = (it != ctx.titles.end());
-            t.title = t.titleMatched ? narrow(it->second) : std::string();
-            if (!t.titleMatched)
-                t.kind = TargetKind::NoWindow;
-            else if (lowerW(it->second).find(L"launcher") != std::wstring::npos)
-                t.kind = TargetKind::Launcher;
-            else
-                t.kind = TargetKind::Game;
-            if (t.kind == TargetKind::Game) t.version = versionFromTitle(it->second);
+            t.exeName = narrow(exeOf[pid]);
+
+            Evidence ev;
+            ev.titleNeedle = cfg.windowTitleContains;
+            auto wi = ctx.windows.find(pid);
+            if (wi != ctx.windows.end()) ev.windows = wi->second;
 
             HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
             if (!h)
@@ -855,13 +920,20 @@ namespace inj
                 DWORD len = static_cast<DWORD>(sizeof(img) / sizeof(img[0]));
                 if (QueryFullProcessImageNameW(h, 0, img, &len)) t.exePath = narrow(std::wstring(img, len));
                 t.startTime = startTimeOf(h);
+                ev.cmd = cmdInfoFor(h, pid, t.startTime);
                 CloseHandle(h);
             }
-            if (t.note.empty())
-            {
-                if (t.kind == TargetKind::Launcher) t.note = "Launcher window, not the game.";
-                else if (t.kind == TargetKind::NoWindow) t.note = "No Minecraft window yet.";
-            }
+
+            const Match m = classifyProcess(ev);
+            t.kind = m.kind;
+            t.title = m.title;
+            t.titleMatched = !m.title.empty();
+            t.version = m.version;
+            t.versionSource = m.versionSource;
+            t.how = m.how;
+            t.launcherBrand = m.launcherBrand;
+            if (t.note.empty() && m.kind != TargetKind::Game) t.note = m.reason;
+
             Status::Block sb{};
             if (Status::read(pid, sb))
             {
@@ -873,7 +945,7 @@ namespace inj
 
         std::stable_sort(out.begin(), out.end(), [](const Target& a, const Target& b)
         {
-            if (a.kind != b.kind) return a.kind < b.kind;   // games, then launchers, then windowless
+            if (a.kind != b.kind) return kindRank(a.kind) < kindRank(b.kind);
             return a.pid < b.pid;
         });
         return out;

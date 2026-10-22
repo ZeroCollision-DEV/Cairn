@@ -1,6 +1,7 @@
 #include "Client.h"
 #include "JVM.h"
 #include "Hooks.h"
+#include "MenuHotkey.h"
 #include "../utils/Logger.h"
 #include "../menu/Menu.h"
 #include "../menu/Theme.h"
@@ -189,12 +190,22 @@ void Client::onFirstFrame()
 // ════════════════════════════════════════════════════════════
 void Client::onRender()
 {
-    // RightShift toggle — always operational, even before m_ready
-    static bool rshiftPrev = false;
-    bool rshiftNow = (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
-    if (rshiftNow && !rshiftPrev)
-        toggleMenu();
-    rshiftPrev = rshiftNow;
+    // Right Shift toggles the menu (VK_RSHIFT only: not Left Shift, not generic Shift). Always operational,
+    // even before m_ready. This is the only code path that toggles the menu. It acts on the key-down edge
+    // only, and only while a window of this process is in the foreground (GetAsyncKeyState is global, so
+    // without that check Right Shift pressed in another application would open the menu), and not while a
+    // menu text field is being typed in (capital letters would otherwise close the menu).
+    {
+        static MenuHotkey hotkey;
+        DWORD fgPid = 0;
+        const HWND fg = GetForegroundWindow();
+        if (fg) GetWindowThreadProcessId(fg, &fgPid);
+        const bool focused = fg && fgPid == GetCurrentProcessId();
+        const bool down = (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+        const bool allowed = menuHotkeyAllowed(focused, Hooks::instance().menuVisible(), ImGui::GetIO().WantTextInput);
+        if (hotkey.update(down, allowed))
+            toggleMenu();
+    }
 
     // Menu rendering (keeps drawing while it fades out)
     if (Hooks::instance().menuVisible() || Menu::instance().isVisibleOrFading())

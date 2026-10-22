@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "../shared/Status.h"
+#include "TargetMatch.h"
 
 namespace inj
 {
@@ -135,22 +136,23 @@ namespace inj
     CleanupReport cleanCache(const Config& cfg, const std::filesystem::path& keep = {});
 
     // ── Target detection ────────────────────────────────────
-    // What we can know about a candidate process without touching the game:
-    //   Game      - a process of the configured name with a visible window whose title contains
-    //               "Minecraft" (and is not a launcher window)
-    //   Launcher  - such a window, but the title says "launcher"
-    //   NoWindow  - the process exists but has no Minecraft window (yet): still loading, a server,
-    //               or some other Java program
-    enum class TargetKind { Game, Launcher, NoWindow };
-
+    // A candidate is a Java process (javaw.exe / java.exe, plus the configured name). Whether it is a playable
+    // Minecraft client is decided by TargetMatch.h from the process's windows and command line, not by its name:
+    //   Game     - owns a visible GLFW game window and was started like Minecraft (or its title says Minecraft)
+    //   Starting - started like Minecraft, no game window yet
+    //   Launcher - a launcher, not the game
+    //   Other    - any other Java process; never offered as an instance
     struct Target
     {
         unsigned long pid = 0;
         std::string exeName;                // e.g. "javaw.exe"
-        std::string title;                  // matched window title, empty when none
-        bool titleMatched = false;
-        TargetKind kind = TargetKind::NoWindow;
-        std::string version;                // parsed from the window title only ("1.21.11"); empty if absent
+        std::string title;                  // the game window's title (empty when there is no window)
+        bool titleMatched = false;          // there is a window title
+        TargetKind kind = TargetKind::Other;
+        std::string version;                // "1.21.11" when the command line or window title states it; else empty
+        std::string versionSource;          // "command line" or "window title"
+        std::string how;                    // what identified it as the game
+        std::string launcherBrand;          // from -Dminecraft.launcher.brand=, informational only
         bool accessible = true;             // false if the process could not be opened
         bool is64 = true;
         std::string note;                   // why it cannot be used, when it cannot

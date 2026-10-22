@@ -233,7 +233,8 @@ struct App
     std::vector<inj::Target> targets;
     unsigned long selPid = 0;
     unsigned long long selStart = 0;
-    std::string lostNote;               // why the previous selection was dropped (closed, no longer usable)
+    std::string lostNote;               // why the previous selection was dropped; expires by itself
+    double lostAt = 0.0;
     double lastScan = -10.0;
 
     bool detailsOpen = false;
@@ -481,12 +482,18 @@ static void runPipeline(App* app, inj::Config cfg, unsigned long pid, unsigned l
 }
 
 // ── Instance list ────────────────────────────────────────────
-// Re-reads the running processes and keeps the selection only if the exact same process (PID and
-// creation time) is still there and still usable. It never switches the selection to another
-// process on its own, except to pick the only candidate when nothing is selected.
-static void rescan(App& a)
+// Re-reads the running Java processes. The selection belongs to one exact process (PID + creation time) and
+// is kept for as long as that process exists, even if its window is briefly missing (it then shows why it is
+// unavailable and the run button stays disabled). It is dropped only when the process is gone or its PID was
+// reused. The injector never moves the selection to another process on its own; with nothing selected and
+// exactly one usable instance, that one is pre-selected.
+static constexpr double kLostNoteSeconds = 8.0;
+
+static void rescan(App& a, double now)
 {
     a.targets = inj::findTargets(a.cfg);
+
+    if (!a.lostNote.empty() && now - a.lostAt > kLostNoteSeconds) a.lostNote.clear();
 
     if (a.selPid)
     {
@@ -494,10 +501,12 @@ static void rescan(App& a)
         for (const auto& t : a.targets)
             if (t.pid == a.selPid && (a.selStart == 0 || t.startTime == 0 || t.startTime == a.selStart)) m = &t;
         if (!m)
-            a.lostNote = "The selected Minecraft instance (PID " + std::to_string(a.selPid) + ") has closed. Select another.";
-        else if (!m->usable())
-            a.lostNote = m->note.empty() ? "The selected instance can no longer be used." : m->note;
-        if (!m || !m->usable()) { a.selPid = 0; a.selStart = 0; }
+        {
+            a.lostNote = "The selected Minecraft instance (PID " + std::to_string(a.selPid) + ") has closed.";
+            a.lostAt = now;
+            a.selPid = 0;
+            a.selStart = 0;
+        }
     }
 
     if (!a.selPid && a.lostNote.empty())
@@ -665,6 +674,7 @@ static bool instanceRow(const inj::Target& t, bool selected, bool enabled, float
     std::string tag;
     ImVec4 tagCol = Col::TextFaint;
     if (t.kind == inj::TargetKind::Launcher) tag = "Launcher";
+    else if (t.kind == inj::TargetKind::Starting) tag = "Starting";
     else if (!t.version.empty())
     {
         tag = t.version;
@@ -676,7 +686,9 @@ static bool instanceRow(const inj::Target& t, bool selected, bool enabled, float
 
     const float rightLimit = p1.x - S(14.0f) - (tag.empty() ? 0.0f : tagW + S(10.0f));
     const ImVec4 clip(x, p.y, rightLimit, p1.y);
-    const std::string title = t.title.empty() ? std::string("Minecraft") : t.title;
+    const std::string title = !t.title.empty() ? t.title
+                              : t.kind == inj::TargetKind::Starting ? std::string("Minecraft (starting)")
+                                                                    : std::string("Java process");
     textAt(dl, rf, ImVec2(x, y1), enabled ? Col::Text : Col::TextDim, title.c_str(), &clip);
 
     // Second line: process name and PID, then a note or the client state.
@@ -839,16 +851,20 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
 
     // Rescan while idle so a closed game disappears and a new one shows up. The list is frozen
     // while an operation runs, so the instance being worked on cannot change under it.
-    if (!busy && timeSec - a.lastScan > 2.0f) { a.lastScan = timeSec; rescan(a); }
+    if (!busy && timeSec - a.lastScan > 2.0f) { a.lastScan = timeSec; rescan(a, timeSec); }
     const inj::Target* sel = selectedTarget(a);
 
-    int usableN = 0, launcherN = 0, windowlessN = 0, gameN = 0;
+    int usableN = 0, launcherN = 0, startingN = 0, gameN = 0, otherN = 0;
     for (const auto& t : a.targets)
     {
         if (t.usable()) usableN++;
-        if (t.kind == inj::TargetKind::Launcher) launcherN++;
-        else if (t.kind == inj::TargetKind::NoWindow) windowlessN++;
-        else gameN++;
+        switch (t.kind)
+        {
+        case inj::TargetKind::Launcher: launcherN++; break;
+        case inj::TargetKind::Starting: startingN++; break;
+        case inj::TargetKind::Game:     gameN++; break;
+        default:                        otherN++; break;
+        }
     }
 
     drawTitleBar(hwnd);
@@ -876,7 +892,7 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
         if (linkButton("##refresh", "Refresh", ImVec2(x0 + w - lw, hp.y - S(4.0f)), !busy))
         {
             a.lastScan = timeSec;
-            rescan(a);
+            rescan(a, timeSec);
         }
     }
 
@@ -890,7 +906,8 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
         int shown = 0;
         for (const auto& t : a.targets)
         {
-            if (t.kind == inj::TargetKind::NoWindow) continue;     // not a game window: summarised below
+            // Other Java processes are never offered, except one that was selected and has lost its window.
+            if (t.kind == inj::TargetKind::Other && t.pid != a.selPid) continue;
             shown++;
             const bool isSel = a.selPid == t.pid;
             if (instanceRow(t, isSel, !busy && t.usable(), rowW) && !isSel)
@@ -907,13 +924,14 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + S(4.0f));
             ImGui::PushFont(semiFont());
             ImGui::PushStyleColor(ImGuiCol_Text, Col::TextDim);
-            ImGui::TextUnformatted(windowlessN ? "Minecraft is starting" : "No Minecraft instance detected");
+            ImGui::TextUnformatted(startingN ? "Minecraft is starting" : "No Minecraft instance detected");
             ImGui::PopStyleColor();
             ImGui::PopFont();
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + S(4.0f));
             captionText(Col::TextFaint,
-                        windowlessN ? "A Java process exists but has no Minecraft window yet. The list refreshes by itself."
-                                    : "Start Minecraft 1.21.11 with Fabric Loader and open the game window.",
+                        startingN ? "Minecraft was started but its game window is not open yet. The list refreshes by itself."
+                                  : otherN ? "Java is running, but nothing there looks like a Minecraft game window."
+                                           : "Start Minecraft 1.21.11 (official launcher or Modrinth App) and open the game window.",
                         true);
         }
     }
@@ -967,6 +985,8 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
     // What, if anything, stops a run right now.
     std::string blocker;
     if (const char* c = configBlockerText(a.cfg, a.check.state)) blocker = c;
+    else if (sel && !sel->usable())
+        blocker = sel->note.empty() ? "The selected process cannot be used right now." : sel->note;
     else if (sel)
     {
         if (sel->clientPresent)
@@ -980,8 +1000,8 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
     else if (usableN == 0)
     {
         if (gameN > 0)           blocker = "The detected Minecraft process cannot be used. See the note above.";
-        else if (launcherN > 0)  blocker = "Only a launcher window was found. Start the game itself.";
-        else if (windowlessN > 0) blocker = "Minecraft is still starting. No game window yet.";
+        else if (startingN > 0)  blocker = "Minecraft is still starting. No game window yet.";
+        else if (launcherN > 0)  blocker = "Only a launcher was found. Start the game from it.";
         else                     blocker = "No Minecraft instance detected.";
     }
     else blocker = usableN > 1 ? "Multiple instances found. Select one." : "Select a Minecraft instance.";
@@ -1014,10 +1034,11 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
         else
         {
             a.lostNote = why.empty() ? "Select a Minecraft instance first." : why;
+            a.lostAt = timeSec;
             a.selPid = 0;
             a.selStart = 0;
             a.pipe.reset();
-            rescan(a);
+            rescan(a, timeSec);
             a.lastScan = timeSec;
             playSfx(Sfx::Error);
         }
@@ -1173,14 +1194,17 @@ static void drawUi(App& a, HWND hwnd, float timeSec)
                 kvRow("Process", sel->exeName + "  PID " + std::to_string(sel->pid) + (sel->is64 ? "  x64" : "  32-bit"));
                 kvRow("Window", sel->title);
                 kvRow("Path", sel->exePath);
-                kvRow("Version", sel->version.empty() ? std::string("not shown in the window title")
-                                                      : sel->version + " (from the window title, not verified)",
+                kvRow("Identified", sel->how.empty() ? std::string("-") : sel->how);
+                kvRow("Version", sel->version.empty() ? std::string("not stated by the command line or window title")
+                                                      : sel->version + " (from the " + sel->versionSource + ", not verified)",
                       sel->version.empty() || sel->version == kExpectedVersion ? Col::Text : Col::Warning);
+                if (!sel->launcherBrand.empty()) kvRow("Launcher", sel->launcherBrand + " (as passed to the game)");
             }
             else
                 kvRow("Process", "none selected");
-            if (windowlessN)
-                kvRow("Ignored", std::to_string(windowlessN) + " Java process(es) with no Minecraft window");
+            for (const auto& t : a.targets)
+                if (t.pid != a.selPid && !t.usable())
+                    kvRow("Skipped", t.exeName + " PID " + std::to_string(t.pid) + ": " + (t.note.empty() ? std::string("not usable") : t.note));
             kvRow("Release", ini::trim(a.cfg.releaseUrl));
             kvRow("SHA-256", inj::normalizeSha256(a.cfg.expectedSha256));
             kvRow("Config", utf8Of(a.cfg.iniPath));
